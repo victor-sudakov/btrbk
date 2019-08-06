@@ -144,6 +144,8 @@ my %config_options = (
   archive_exclude             => { default => undef,     accept_file => { wildcards => 1 }, allow_multiple => 1, context => [ "global" ] },
   archive_exclude_older       => { default => undef,     accept => [ "yes", "no" ] },
 
+  cache_dir                   => { default => undef,     accept_file => { absolute => 1 }, allow_multiple => 1, context => [ "root" ] },
+
   # deprecated options
   ssh_port                    => { default => "default", accept => [ "default" ], accept_numeric => 1,
                                    deprecated => { DEFAULT => { warn => 'Please use "ssh://hostname[:port]" notation in the "volume" and "target" configuration lines.' } } },
@@ -2257,6 +2259,76 @@ sub system_urandom($;$) {
   die "unsupported format";
 }
 
+sub read_extentmap_cache($)
+{
+  my $vol = shift;
+  my $cache_dir = config_key($vol, 'cache_dir');
+  return undef unless($cache_dir);
+
+  my $file;
+  my $uuid = $vol->{node}{uuid} // die;
+  my $blocksize = 0;
+  my $time = 0;
+  my @range;
+  foreach (@$cache_dir) {
+    $file = "$_/${uuid}.extentmap.bin";
+    next unless (-f $file);
+
+    DEBUG "Reading extentmap cache: $file";
+    if(open(my $fh, '<:raw', $file)) {
+      my $buf;
+      read $fh, $buf, length("btrbk_extentmap_v1");
+      if($buf eq "btrbk_extentmap_v1") {
+        read $fh, $buf, 16;
+        ($time, $blocksize) = unpack('Q<Q<', $buf);
+        while(read $fh, $buf, 16) { # read / unpack two words
+          push @range, [ unpack('Q<Q<', $buf) ];
+          # TRACE "read_extentmap_cache: range " . join("..", @{$range[-1]});
+        };
+      }
+      close($fh);
+      last;
+    } else {
+      ERROR "Failed to open '$file': $!";
+    }
+  }
+  return undef unless($time && $blocksize); # empty range is valid
+
+  DEBUG "Read " . scalar(@range) . " block regions (blocksize=$blocksize, timestamp=" . localtime($time) . ") from: $file";
+  return { blocksize => $blocksize, rmap => \@range, CACHED => $file };
+}
+
+sub write_extentmap_cache($$)
+{
+  my $vol = shift;
+  my $extmap = shift;
+  my $cache_dir = config_key($vol, 'cache_dir');
+  return undef unless($cache_dir);
+  unless($vol->{node}{readonly}) {
+    DEBUG "Skip writing extentmap cache (not readonly): $vol->{PRINT}";
+    return undef;
+  }
+
+  my $uuid = $vol->{node}{uuid} // die;
+  foreach (@$cache_dir) {
+    unless(-d $_) {
+      WARN_ONCE "Ignoring cache_dir (not a directory): $_";
+      next;
+    }
+    my $file = "$_/${uuid}.extentmap.bin";
+
+    INFO "Writing extentmap cache: $file";
+    if(open(my $fh, '>:raw', $file)) {
+      # pack Q: unsigned quad (64bit, Documentation/filesystems/fiemap.txt)
+      print $fh "btrbk_extentmap_v1";
+      print $fh pack('Q<Q<', time, $extmap->{blocksize});
+      print $fh pack('Q<*', map(@{$_}, @{$extmap->{rmap}}));
+      close($fh);
+    } else {
+      WARN "Failed to create '$file': $!";
+    }
+  }
+}
 
 # returns extents range (sorted array of [start,end], inclusive) from FIEMAP ioctl
 sub filefrag_extentmap($)
@@ -2264,7 +2336,14 @@ sub filefrag_extentmap($)
   my $vol = shift || die;
   my $blocksize = 0;
   my $starttime = time;
-  INFO("Fetching extent information (filefrag) for: $vol->{PRINT}");
+
+  if(my $extmap = read_extentmap_cache($vol)) {
+    INFO "Using cached extents map for: $vol->{PRINT}";
+    return $extmap;
+  }
+
+  INFO("Fetching extent information for: $vol->{PRINT}");
+
   # NOTE: this returns exitstatus=0 if file is not found, or no files found
   my $ret = run_cmd({ cmd => [ 'find', { unsafe => $vol->{PATH} }, '-xdev', '-type', 'f',
                                '-exec', 'filefrag -vs \{\} +' ],
@@ -2285,7 +2364,10 @@ sub filefrag_extentmap($)
     return undef;
   }
   DEBUG("Parsed " . scalar(@range) . " block regions (blocksize=$blocksize) in " . (time - $starttime) . "s for: $vol->{PRINT}");
-  return extentmap_merge({ blocksize => $blocksize, rmap => \@range });
+
+  my $merged = extentmap_merge({ blocksize => $blocksize, rmap => \@range });
+  write_extentmap_cache($vol, $merged);
+  return $merged;
 }
 
 
