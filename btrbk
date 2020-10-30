@@ -2334,7 +2334,7 @@ sub write_extentmap_cache($$)
 sub filefrag_extentmap($)
 {
   my $vol = shift || die;
-  my $blocksize = 0;
+  my $blocksize = 1024; # enforced by `filefrag -k`
   my $starttime = time;
 
   if(my $extmap = read_extentmap_cache($vol)) {
@@ -2346,22 +2346,14 @@ sub filefrag_extentmap($)
 
   # NOTE: this returns exitstatus=0 if file is not found, or no files found
   my $ret = run_cmd({ cmd => [ 'find', { unsafe => $vol->{PATH} }, '-xdev', '-type', 'f',
-                               '-exec', 'filefrag -vs \{\} +' ],
+                               '-exec', 'filefrag -v -k \{\} +' ],
                       large_output => 1});
   return undef unless(defined($ret));
 
   my @range; # array of [start,end]
-  foreach (split(/\n/, $ret)) {
+  foreach (@$ret) {
     next if /inline/; # ignore inline data, this seems wrong
     push @range, [ $1, $2 ] if(/^\s*[0-9]+:\s*[0-9]+\.\.\s*[0-9]+:\s*([0-9]+)\.\.\s*([0-9]+):/);
-    if(/blocks? of ([0-9]+) bytes/) {
-      $blocksize ||= $1;
-      WARN_ONCE "filefrag: reports blocksize=$1 (was $blocksize) in: $vol->{PRINT}" if($1 != $blocksize);
-    }
-  }
-  unless($blocksize) {
-    ERROR "Failed to parse filefrag results (missing blocksize): $vol->{PRINT}";
-    return undef;
   }
   DEBUG("Parsed " . scalar(@range) . " block regions (blocksize=$blocksize) in " . (time - $starttime) . "s for: $vol->{PRINT}");
 
